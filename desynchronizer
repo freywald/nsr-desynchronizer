@@ -1,0 +1,361 @@
+#!/bin/bash
+
+function nclr() {
+	local j
+	for ((j = 0; j <= "${1:-1}"; j++ )); do
+		tput cuu1
+	done
+
+	tput ed
+}
+
+function array_contains()
+{
+	local token="$1"
+	shift
+
+	for element in "$@"; do
+		[[ "$token" == "$element" ]] && return 0
+	done
+
+	return 1
+}
+
+routes_files=($(ls -- ./*".routes" 2> "/dev/null")) # take the first .routes file
+
+if [[ ${#routes_files[@]} == 0 ]]; then
+	echo>&2 -e "ERROR: No *.routes file found!"
+	exit 1
+elif [[ ${#routes_files[@]} -ge 1 ]]; then
+	PS3='Which route file shall be used?'
+	select name in "${routes_files[@]}"; do
+		for reply in $REPLY; do
+			if [[ "$reply" =~ ^[0-9]+$ ]]; then
+               routes_file="${routes_files[reply-1]}"
+               break 2
+            else
+               continue
+            fi
+		done
+	done
+else
+	routes_file="${routes_files[0]}"
+fi
+
+length=1
+current_line_number=1
+i=0
+queue_configuration_options_count=0
+queue_configuration_options=()
+queue_configuration_options_wideness=()
+
+function __desynchronize_with_configuration() {
+	# linearized array data with arbitrary wideness
+	queue_configuration_options+=("$@")
+	queue_configuration_options_wideness+=($#)
+	((queue_configuration_options_count++))
+}
+
+forwardable_parameter="rsync-options"
+
+# shellcheck source=/dev/null
+source -- "$routes_file"
+
+cursor=0
+for (( r = 0; r < queue_configuration_options_count; r++)); do
+	wideness="${queue_configuration_options_wideness[r]}"
+
+	verbose=false
+	simulate=false
+	validate=false
+	remote=""
+	forwarded_parameters=()
+	unknown_parameters=()
+
+	queue_parameters=()
+
+	for queue_configuration_option in "$@"; do
+    	queue_parameters+=("$queue_configuration_option")
+    done
+
+	for queue_configuration_option in "${queue_configuration_options[@]:$cursor:$wideness}"; do
+		queue_parameters+=("$queue_configuration_option")
+	done
+
+	original_program_arguments="${queue_parameters[*]}"
+	long_options="simulate,validate,verbose,mirror,flat,non-flat,flat-postfix:,source:,target:,description:,source-pre-hook:,source-post-hook:,target-pre-hook:,target-post-hook:"
+	short_options=":"
+	parsed_options=$(getopt --options="$short_options" --longoptions="$long_options" --name "$0" -- "${queue_parameters[@]}") || true
+	eval "set -- $parsed_options"
+
+	while (($#)); do
+		case "$1" in
+			--mirror)
+				flat_structure=true
+				structure_postfix=""
+				;;
+			--flat)
+				flat_structure=true
+				structure_postfix=".desynchronizer-target"
+				;;
+			--flat-postfix)
+				flat_structure=true
+				structure_postfix="$2"
+				shift
+				;;
+			--non-flat)
+				flat_structure=false
+				structure_postfix=""
+				;;
+			--target)
+				target="$2"
+				shift
+				;;
+			--source)
+				source="$2"
+				shift
+				;;
+			--description)
+				description="$2"
+				shift
+				;;
+			--source-pre-hook)
+				source_pre_hook="${2}"
+				shift
+				;;
+			--source-post-hook)
+				source_post_hook="${2}"
+				shift
+				;;
+			--target-pre-hook)
+				target_pre_hook="${2}"
+				shift
+				;;
+			--target-post-hook)
+				target_post_hook="${2}"
+				shift
+				;;
+			--verbose)
+				verbose=true
+				;;
+			--simulate)
+				simulate=true
+				;;
+			--validate)
+				validate=true
+				;;
+			--)
+				if [[ -n "$2" ]]; then
+					echo>&2 "UNKNOWN_DATA: $2"
+					exit 1
+				fi
+				shift
+				break
+				;;
+			*)
+				echo>&2 "UNKNOWN_PARAM: $1"
+				exit 1
+				;;
+		esac
+		shift
+	done
+
+	ignore_everything_but_known_parameter_list=(
+		"--validate"
+		"--simulate"
+		"--verbose"
+		"--mirror"
+		"--flat"
+		"--non-flat"
+		"--flat-postfix"
+		"--source"
+		"--target"
+		"--description"
+		"--source-pre-hook"
+		"--source-post-hook"
+		"--target-pre-hook"
+		"--target-post-hook"
+		"--$forwardable_parameter"
+    )
+
+	collect_arguments_until_double_slash=false
+	open_unknown=false
+	open_forward=false
+	for parameter in $original_program_arguments; do
+		name="${parameter%%=*}"
+		value="${parameter#*=}"
+
+		if [[ "--$forwardable_parameter" == "$name"* ]]; then
+			is_forwardable_parameter=true
+		else
+			is_forwardable_parameter=false
+		fi
+
+		if $is_forwardable_parameter || ! array_contains "$name" "${ignore_everything_but_known_parameter_list[@]}"; then
+			if [[ "${name:0:2}" == "--" ]]; then
+				if $is_forwardable_parameter; then
+					forwarded_parameters+=( "$value" )
+					open_unknown=false
+                    open_forward=true
+				else
+					unknown_parameters+=( "$parameter" )
+					open_unknown=true
+                    open_forward=false
+				fi
+
+				collect_arguments_until_double_slash=true
+			elif $collect_arguments_until_double_slash; then
+				if $open_forward; then
+					forwarded_parameters[-1]="${forwarded_parameters[-1]} $parameter"
+				elif $open_unknown; then
+					unknown_parameters[-1]="${unknown_parameters[-1]} $parameter"
+				fi
+			else
+				collect_arguments_until_double_slash=false
+			fi
+		fi
+	done
+
+	current_date="$(date +%Y%m%d%H%M%S)"
+
+	if [[ "$filter_rules_file" == "" && -f "desynchronizer.filter-rules" ]]; then
+		filter_rules_file="desynchronizer.filter-rules"
+	fi
+
+    if [[ -n "$source_pre_hook" ]]; then
+    	if [[ "${source_pre_hook:0:1}" != "/" ]]; then
+            source_pre_hook="$source/$source_pre_hook"
+        fi
+   		source_pre_hook="$(realpath --quiet -- "$source_pre_hook")"
+    fi
+
+    if [[ -n "$source_post_hook" ]]; then
+    	if [[ "${source_post_hook:0:1}" != "/" ]]; then
+            source_post_hook="$source/$source_post_hook"
+        fi
+    	source_post_hook="$(realpath --quiet -- "$source_post_hook")"
+    fi
+
+    if [[ -n "$target_pre_hook" ]]; then
+    	 if [[ "${target_pre_hook:0:1}" != "/" ]]; then
+              target_pre_hook="$target/$target_pre_hook"
+        fi
+   		target_pre_hook="$(realpath --quiet -- "$target_pre_hook")"
+    fi
+
+    if [[ -n "$target_post_hook" ]]; then
+    	if [[ "${target_post_hook:0:1}" != "/" ]]; then
+        	target_post_hook="$target/$target_post_hook"
+        fi
+    	target_post_hook="$(realpath --quiet -- "$target_post_hook")"
+	fi
+
+	if [[ -z "$target_pre_hook" ]]; then
+		target_pre_hook="$source_pre_hook"
+	fi
+
+	if [[ -z "$target_post_hook" ]]; then
+    	target_post_hook="$source_post_hook"
+    fi
+
+	basename="$(basename -- "$source")"
+
+	if (( ${#unknown_parameters[@]} > 0 )); then
+			echo>&2 "ERROR: unknown parameters: $1"
+			for queue_configuration_option in "${unknown_parameters[@]}"; do
+				echo>&2 "\n *$queue_configuration_option*"
+			done
+    	exit 1
+    fi
+
+    debug=false
+
+	if $debug; then
+		echo -ne "\n\n forwarded_parameters:\n"
+		for queue_configuration_option in "${forwarded_parameters[@]}"; do
+			echo "$queue_configuration_option"
+		done
+		echo "$source_pre_hook"
+		echo "$source_post_hook"
+		echo "$target_pre_hook"
+		echo "$target_post_hook"
+    fi
+
+	custom_options=("${forwarded_parameters[@]}")
+
+	if [[ -n "$filter_rules_file" ]]; then
+    	custom_options+=(--filter="merge $filter_rules_file")
+    fi
+
+	options_that_take_precedence_last=()
+	if $flat_structure; then
+		target="$target$structure_postfix"
+		synchronizer_application_data_path="$target/.desynchronizer/$current_date"
+		backup_directory="$synchronizer_application_data_path/backup-files"
+		my_default_log_file="$synchronizer_application_data_path/default.log"
+		error_log_file="$synchronizer_application_data_path/error.log"
+
+		options_that_take_precedence_last+=(--exclude='/.desynchronizer/')
+		options_that_take_precedence_last+=(--filter='hide /.desynchronizer/') # when --delete-excluded is used, then do not delete this item, even if it is excluded
+		options_that_take_precedence_last+=(--filter='protect /.desynchronizer/') # when --delete-excluded is used, then do not delete this item, even if it is excluded
+	else
+		synchronizer_application_data_path="$target/desynchronizer/$current_date"
+		target="$target/files/"
+        backup_directory="$synchronizer_application_data_path/backup-files"
+        my_default_log_file="$synchronizer_application_data_path/default.log"
+        error_log_file="$synchronizer_application_data_path/error.log"
+	fi
+
+	if [[ -n "$remote" ]]; then # @todo remote desynchronization  is not supported for synchronizer atm
+    	#remote="$remote:$target"
+    	remote="$target"
+    else
+    	remote="$target"
+    fi
+
+	echo -e "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+	echo -e "SYNCHRONIZING BY DESYNCHRONIZING\n"
+	echo -e "Folder:\t\t\t\t\t\t\t\t\t$basename"
+	echo -e "Description:\t\t\t\t\t\t\t$description.\n\n"
+	echo -e "Source:\t\t\t\t\t\t\t\t\t$source"
+	echo -e "Target:\t\t\t\t\t\t\t\t\t$target"
+	echo -e "Desynchronizer application data path:\t$synchronizer_application_data_path"
+	echo -e "\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+
+	read -r -p "Press enter to continue…"
+	nclr 10
+
+	mkdir --parents -- "$synchronizer_application_data_path/backup-files"
+
+	[[ -n "$source_pre_hook" ]] && (cd -- "$source" && "$source_pre_hook" "pre" "source")
+	[[ -n "$target_pre_hook" ]] && (cd -- "$target" && "$target_pre_hook" "pre" "target")
+
+	if $simulate; then
+		custom_options+=("--dry-run")
+	fi
+	if $validate; then
+		custom_options+=("--checksum")
+	fi
+	if $verbose; then
+		echo -e "Route configuration: ${queue_parameters[*]}\n"
+		echo \$ rsync "${custom_options[@]}" -habHAXE --delete --delete-excluded --info=progress2 --inplace --backup --force --progress --stats --log-file="$my_default_log_file" --backup-dir="$backup_directory" "${options_that_take_precedence_last[@]}" -- "$source/" "$remote/" "2> $error_log_file"
+		read -r -p "Please review the configuration and then press enter to start…"
+	fi
+
+	rsync "${custom_options[@]}" -habHAXE --delete --delete-excluded --info=progress2 --inplace --backup --force --progress --stats --log-file="$my_default_log_file" --backup-dir="$backup_directory" "${options_that_take_precedence_last[@]}" -- "$source/" "$remote/" 2> "$error_log_file"
+
+	cat -- "$error_log_file"
+
+	[[ -n "$source_post_hook" ]] && (cd -- "$source" && "$source_post_hook" "post" "source")
+	[[ -n "$target_post_hook" ]] && (cd -- "$target" && "$target_post_hook" "post" "target")
+
+	[[ -d "$synchronizer_application_data_path/backup-files" && -z "$(ls -1qA -- "$synchronizer_application_data_path/backup-files" 2>"/dev/null")" ]] && rmdir -- "$synchronizer_application_data_path/backup-files"
+	[[ -f "$my_default_log_file" && ! -s "$my_default_log_file" ]] && rm -- "$my_default_log_file"
+	[[ -f "$error_log_file" && ! -s "$error_log_file" ]] && rm -- "$error_log_file"
+
+	echo -ne "\n\n"
+
+	((cursor+=wideness))
+	((current_line_number+=1))
+	((i+=length))
+done
